@@ -5,84 +5,87 @@ import threading
 
 ENCODING = "utf-8"
 RECV_BUF = 4096
-HEADER_SIZE = 8
+FIXED_MSG_SIZE = 1024
 
 
-def recv_loop(sock):
+def recv_loop(sock, username):
+    """Receive loop."""
+    os.makedirs(username, exist_ok=True)
+    file_mode = False
+    filename = ""
+    filesize = 0
+    f = None
+
     while True:
         try:
-            data = sock.recv(RECV_BUF)
+            data = sock.recv(FIXED_MSG_SIZE)
             if not data:
-                print("\nServer disconnected.")
                 break
-            print(data.decode(ENCODING), end="")
+
+            text = data.decode(ENCODING).rstrip()
+
+            if file_mode:
+                if text == "TCP_FILE_START":
+                    file_mode = True
+                    continue
+                elif text == "TCP_FILE_END":
+                    print(f"\nDownloaded {filename} ({filesize} bytes)")
+                    file_mode = False
+                    f.close()
+                    continue
+                elif "TCP_FILE" not in text:
+                    # File data
+                    f.write(data)
+                    continue
+
+            print(text, end="")
+
+            # Handle file responses
+            if text.startswith("SUCCESS"):
+                print("\n")
+            elif text == "TCP_FILE_START":
+                file_mode = True
+            elif text.startswith(str(0).zfill(8)) or text[0].isdigit():
+                filesize = int(text)
+                filename = "downloaded_file"  # Set from command context
+                f = open(os.path.join(username, filename), 'wb')
+            elif text.startswith("UDP_DOWNLOAD"):
+                parts = text.split()
+                udp_filename = parts[1]
+                # Start UDP download in thread
+                threading.Thread(target=lambda: download_udp_file(sock.getpeername()[0],
+                                                                  int(parts[2]),
+                                                                  udp_filename, username),
+                                 daemon=True).start()
+
         except:
             break
+
+    sock.close()
     os._exit(0)
 
 
-def download_tcp_file(sock, filename, username):
-    """Download file over TCP."""
-    os.makedirs(username, exist_ok=True)
-    filepath = os.path.join(username, filename)
-
-    with open(filepath, 'wb') as f:
-        # Wait for file start
-        start_msg = sock.recv(RECV_BUF).decode(ENCODING).strip()
-        if "FILE_NOT_FOUND" in start_msg or "ERROR" in start_msg:
-            print(start_msg)
-            return
-
-        # Read header
-        header = sock.recv(HEADER_SIZE)
-        filesize = int(header.decode(ENCODING))
-
-        bytes_received = 0
-        while bytes_received < filesize:
-            chunk = sock.recv(min(RECV_BUF, filesize - bytes_received))
-            if not chunk:
-                break
-            f.write(chunk)
-            bytes_received += len(chunk)
-
-        end_msg = sock.recv(RECV_BUF).decode(ENCODING).strip()
-        print(f"\nDownloaded {filename} ({filesize} bytes) via TCP")
-
-    print(f"Saved to {filepath}")
-
-
-def download_udp_file(hostname, port, filename, username):
-    """Download file over UDP."""
-    os.makedirs(username, exist_ok=True)
-    filepath = os.path.join(username, filename)
-
+def download_udp_file(host, port, filename, username):
+    """UDP file download."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(15.0)
+    sock.settimeout(10)
+    os.makedirs(username, exist_ok=True)
+    filepath = os.path.join(username, filename)
 
     try:
-        # Wait for file start
-        start_msg, _ = sock.recvfrom(RECV_BUF)
-        if b"FILE_NOT_FOUND" in start_msg:
-            print("File not found")
-            return
-
-        # Read header
-        header, _ = sock.recvfrom(HEADER_SIZE)
-        filesize = int(header.decode(ENCODING))
+        data, _ = sock.recvfrom(RECV_BUF)
+        filesize = int(data.decode(ENCODING))
 
         with open(filepath, 'wb') as f:
-            bytes_received = 0
-            while bytes_received < filesize:
-                chunk, _ = sock.recvfrom(min(RECV_BUF, filesize - bytes_received))
+            bytes_recvd = 0
+            while bytes_recvd < filesize:
+                chunk, _ = sock.recvfrom(RECV_BUF)
                 f.write(chunk)
-                bytes_received += len(chunk)
+                bytes_recvd += len(chunk)
 
-            end_msg, _ = sock.recvfrom(RECV_BUF)
-            print(f"\nDownloaded {filename} ({filesize} bytes) via UDP")
-            print(f"Saved to {filepath}")
-
-    except socket.timeout:
-        print("UDP download timeout")
+        print(f"\nDownloaded {filename} ({filesize} bytes) via UDP")
+    except:
+        print("UDP download failed")
     finally:
         sock.close()
 
@@ -95,39 +98,25 @@ def main():
     username, hostname, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.connect((hostname, port))
-        sock.sendall(username.encode(ENCODING))
+    sock.connect((hostname, port))
+    sock.sendall(username.encode(ENCODING))
 
-        print("Connected. Commands:")
-        print("  /quit, /files, /get tcp filename, /get udp filename\n")
+    print("Connected. Commands: /quit /files /get tcp file /get udp file\n")
 
-        recv_thread = threading.Thread(target=recv_loop, args=(sock,), daemon=True)
-        recv_thread.start()
+    recv_thread = threading.Thread(target=recv_loop, args=(sock, username), daemon=True)
+    recv_thread.start()
 
-        while True:
-            try:
-                msg = input()
-                if msg.strip().lower() == "quit":
-                    sock.sendall(b"/quit")
-                    break
-
-                full_msg = msg + "\n"
-                sock.sendall(full_msg.encode(ENCODING))
-
-                # Check for UDP download instruction from server
-                if msg.startswith("/get udp"):
-                    # Server will respond with "UDP_DOWNLOAD filename port"
-                    pass  # Handled by recv_loop parsing below
-
-            except EOFError:
+    while True:
+        try:
+            msg = input()
+            if msg.strip().lower() == "quit":
+                sock.sendall(b"/quit")
                 break
+            sock.sendall(msg.ljust(FIXED_MSG_SIZE).encode(ENCODING))
+        except:
+            break
 
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        sock.close()
-        os._exit(0)
+    sock.close()
 
 
 if __name__ == "__main__":
