@@ -2,6 +2,7 @@ import sys
 import os
 import socket
 import select
+import time
 from collections import defaultdict
 
 # ===== Constants =====
@@ -119,7 +120,7 @@ def send_files_list(sock):
 
 
 def tcp_file_transfer(sock, filename):
-    """TCP file download using a clear header + length."""
+    """TCP file download - FIXED: temporarily make socket blocking."""
     shared_dir = os.environ.get("SERVER_SHARED_FILES", "SharedFiles")
     filepath = os.path.join(shared_dir, filename)
 
@@ -133,13 +134,25 @@ def tcp_file_transfer(sock, filename):
     header = f"TCP_FILE {filename} {filesize}"
     send_fixed(sock, header)
 
-    # Stream raw bytes; client will read exactly 'filesize' bytes
-    with open(filepath, "rb") as f:
-        while True:
-            chunk = f.read(RECV_BUF)
-            if not chunk:
-                break
-            sock.sendall(chunk)
+    # IMPORTANT: Give client time to process header and switch to download mode
+    time.sleep(0.1)
+
+    # FIXED: Make socket blocking for reliable file transfer
+    sock.setblocking(True)
+
+    try:
+        # Stream raw bytes; client will read exactly 'filesize' bytes
+        with open(filepath, "rb") as f:
+            sent = 0
+            while sent < filesize:
+                chunk = f.read(RECV_BUF)
+                if not chunk:
+                    break
+                sock.sendall(chunk)
+                sent += len(chunk)
+    finally:
+        # Restore non-blocking mode
+        sock.setblocking(False)
 
 
 def handle_file_command(sock, parts):
@@ -275,7 +288,7 @@ def main():
                                                 "addr": addr}
                         name_to_sock[username] = client_sock
 
-                        welcome = f"Welcome to the chat, {username}!"
+                        welcome = f"Welcome {username}!"
                         send_fixed(client_sock, welcome)
                         broadcast(f"[{username}] has joined",
                                   exclude_sock=client_sock)
@@ -310,12 +323,17 @@ def main():
                                 str(filesize).encode(ENCODING), addr
                             )
 
+                            # FIXED: Add delay to prevent UDP packet flooding
+                            time.sleep(0.01)
+
                             with open(filepath, "rb") as f:
                                 while True:
-                                    chunk = f.read(RECV_BUF)
+                                    chunk = f.read(1400)  # Smaller chunks for UDP
                                     if not chunk:
                                         break
                                     udp_sock.sendto(chunk, addr)
+                                    # FIXED: Pace UDP packets to prevent overflow
+                                    time.sleep(0.001)  # 1ms delay between packets
                     except:
                         continue
 

@@ -2,6 +2,7 @@ import sys
 import os
 import socket
 import threading
+import time
 
 ENCODING = "utf-8"
 RECV_BUF = 4096
@@ -16,33 +17,36 @@ def recv_loop(sock, username):
     tcp_filename = None
     tcp_remaining = 0
     tcp_file = None
+    tcp_filesize = 0
 
     while True:
         try:
-            # Always recv RECV_BUF for consistency
-            data = sock.recv(RECV_BUF)
+            # FIXED: Use larger buffer for file downloads
+            if tcp_file is not None and tcp_remaining > 0:
+                # In download mode - read more aggressively
+                data = sock.recv(min(tcp_remaining, 65536))
+            else:
+                # Normal control message mode
+                data = sock.recv(RECV_BUF)
+
             if not data:
                 break
 
             # If in TCP file download mode, treat as raw bytes
             if tcp_file is not None and tcp_remaining > 0:
-                to_write = min(len(data), tcp_remaining)
-                tcp_file.write(data[:to_write])
-                tcp_remaining -= to_write
+                tcp_file.write(data)
+                tcp_remaining -= len(data)
                 if tcp_remaining <= 0:
                     tcp_file.close()
                     tcp_file = None
-                    print(f"\nDownloaded {tcp_filename} via TCP (complete)")
-                else:
-                    # Still more bytes to read
-                    pass
+                    print(f"\nDownloaded {tcp_filename} ({tcp_filesize} bytes) via TCP")
                 continue
 
             # Normal control message mode
             try:
                 text = data.decode(ENCODING).rstrip()
             except UnicodeDecodeError:
-                # Shouldn't happen in control mode
+                # Might be binary data, skip
                 continue
 
             # Handle TCP file header: "TCP_FILE filename size"
@@ -50,10 +54,11 @@ def recv_loop(sock, username):
                 parts = text.split()
                 if len(parts) >= 3:
                     tcp_filename = parts[1]
-                    tcp_remaining = int(parts[2])
+                    tcp_filesize = int(parts[2])
+                    tcp_remaining = tcp_filesize
                     filepath = os.path.join(username, tcp_filename)
                     tcp_file = open(filepath, "wb")
-                    print(f"\nStarting TCP download: {tcp_filename} ({tcp_remaining} bytes)")
+                    print(f"\nStarting TCP download: {tcp_filename} ({tcp_filesize} bytes)")
                 continue
 
             # Handle UDP info: "UDP_INFO filename port"
@@ -72,7 +77,7 @@ def recv_loop(sock, username):
 
             # Normal control text
             print(text)
-        except:
+        except Exception as e:
             break
 
     # Clean up
@@ -83,9 +88,13 @@ def recv_loop(sock, username):
 
 
 def download_udp_file(host, port, filename, username):
-    """UDP file download (simple, no retransmissions)."""
+    """UDP file download - FIXED: Better timeout and buffer handling."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(10)
+    sock.settimeout(5)  # Reduced timeout
+
+    # FIXED: Increase UDP receive buffer to handle bursts
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)  # 256KB buffer
+
     os.makedirs(username, exist_ok=True)
     filepath = os.path.join(username, filename)
 
@@ -103,16 +112,30 @@ def download_udp_file(host, port, filename, username):
 
         with open(filepath, "wb") as f:
             bytes_recvd = 0
-            while bytes_recvd < filesize:
-                chunk, _ = sock.recvfrom(RECV_BUF)
-                if not chunk:
-                    break
-                f.write(chunk)
-                bytes_recvd += len(chunk)
+            consecutive_timeouts = 0
 
-        print(f"\nDownloaded {filename} ({filesize} bytes) via UDP")
-    except:
-        print("\nUDP download failed")
+            while bytes_recvd < filesize:
+                try:
+                    # FIXED: Larger recv buffer for UDP
+                    chunk, _ = sock.recvfrom(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    bytes_recvd += len(chunk)
+                    consecutive_timeouts = 0  # Reset on successful receive
+                except socket.timeout:
+                    consecutive_timeouts += 1
+                    if consecutive_timeouts > 10:
+                        # Give up after too many timeouts
+                        break
+                    continue
+
+        if bytes_recvd >= filesize:
+            print(f"\nDownloaded {filename} ({filesize} bytes) via UDP")
+        else:
+            print(f"\nUDP download incomplete: {bytes_recvd}/{filesize} bytes")
+    except Exception as e:
+        print(f"\nUDP download failed: {e}")
     finally:
         sock.close()
 
