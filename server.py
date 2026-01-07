@@ -9,15 +9,13 @@ from collections import defaultdict
 ENCODING = "utf-8"
 RECV_BUF = 4096
 FIXED_MSG_SIZE = 1024
+TCP_FILE_DELAY = 0.1
+UDP_PACING_DELAY = 0.001
 
-# TCP clients: sock -> {"username": str, "addr": (ip, port)}
 clients = {}
-# username -> sock
 name_to_sock = {}
-# groupname -> set(sock)
 groups = defaultdict(set)
 
-# UDP for file transfer
 UDP_PORT = 13000
 
 
@@ -42,7 +40,8 @@ def broadcast(message: str, exclude_sock=None):
             continue
         try:
             send_fixed(sock, message)
-        except:
+        except Exception as e:
+            print(f"Broadcast error: {e}")
             handle_disconnect(sock)
 
 
@@ -52,7 +51,8 @@ def unicast(username: str, message: str):
     if sock is not None and sock in clients:
         try:
             send_fixed(sock, message)
-        except:
+        except Exception as e:
+            print(f"Unicast error to {username}: {e}")
             handle_disconnect(sock)
 
 
@@ -65,7 +65,8 @@ def groupcast(group: str, message: str, exclude_sock=None):
             continue
         try:
             send_fixed(sock, message)
-        except:
+        except Exception as e:
+            print(f"Groupcast error: {e}")
             handle_disconnect(sock)
 
 
@@ -82,7 +83,6 @@ def handle_disconnect(sock):
     username = info["username"]
     name_to_sock.pop(username, None)
 
-    # Remove from all groups
     for g in list(groups.keys()):
         if sock in groups[g]:
             groups[g].discard(sock)
@@ -95,7 +95,7 @@ def handle_disconnect(sock):
         pass
 
     print(f"Client {username} disconnected")
-    broadcast(f"[{username}] has left")
+    broadcast(f"{username} has left")
 
 
 # ===== File functions =====
@@ -111,16 +111,22 @@ def send_files_list(sock):
     files = [f for f in os.listdir(shared_dir)
              if os.path.isfile(os.path.join(shared_dir, f))]
     count = len(files)
-    response_lines = [f"SUCCESS {count} files:"]
+
+    send_fixed(sock, f"FILES_START {count}")
+
     for fname in files:
-        size = os.path.getsize(os.path.join(shared_dir, fname))
-        response_lines.append(f"{fname} ({size} bytes)")
-    response = "\n".join(response_lines)
-    send_fixed(sock, response)
+        try:
+            size = os.path.getsize(os.path.join(shared_dir, fname))
+            send_fixed(sock, f"FILE_ENTRY {fname} {size}")
+        except Exception as e:
+            print(f"Error getting file info for {fname}: {e}")
+            continue
+
+    send_fixed(sock, "FILES_END")
 
 
 def tcp_file_transfer(sock, filename):
-    """TCP file download - FIXED: temporarily make socket blocking."""
+    """TCP file download."""
     shared_dir = os.environ.get("SERVER_SHARED_FILES", "SharedFiles")
     filepath = os.path.join(shared_dir, filename)
 
@@ -130,18 +136,14 @@ def tcp_file_transfer(sock, filename):
 
     filesize = os.path.getsize(filepath)
 
-    # Header: TCP_FILE filename size (padded to FIXED_MSG_SIZE)
     header = f"TCP_FILE {filename} {filesize}"
     send_fixed(sock, header)
 
-    # IMPORTANT: Give client time to process header and switch to download mode
-    time.sleep(0.1)
+    time.sleep(TCP_FILE_DELAY)
 
-    # FIXED: Make socket blocking for reliable file transfer
     sock.setblocking(True)
 
     try:
-        # Stream raw bytes; client will read exactly 'filesize' bytes
         with open(filepath, "rb") as f:
             sent = 0
             while sent < filesize:
@@ -150,15 +152,16 @@ def tcp_file_transfer(sock, filename):
                     break
                 sock.sendall(chunk)
                 sent += len(chunk)
+    except Exception as e:
+        print(f"Error during TCP file transfer: {e}")
     finally:
-        # Restore non-blocking mode
         sock.setblocking(False)
 
 
 def handle_file_command(sock, parts):
-    """Handle /get tcp|udp filename."""
+    """Handle /get tcp|udp [filename]."""
     if len(parts) != 3:
-        send_fixed(sock, "Usage: /get tcp|udp filename")
+        send_fixed(sock, "Usage: /get tcp|udp [filename]")
         return
 
     proto = parts[1].lower()
@@ -167,7 +170,6 @@ def handle_file_command(sock, parts):
     if proto == "tcp":
         tcp_file_transfer(sock, filename)
     elif proto == "udp":
-        # Inform client to use UDP_PORT for this filename
         info = f"UDP_INFO {filename} {UDP_PORT}"
         send_fixed(sock, info)
     else:
@@ -178,6 +180,9 @@ def handle_file_command(sock, parts):
 
 def process_message(sock, text):
     """Handle a command or normal chat message from a client."""
+    if sock not in clients:
+        return True
+
     username = clients[sock]["username"]
 
     if text.startswith("/"):
@@ -186,6 +191,7 @@ def process_message(sock, text):
 
         if cmd == "/quit":
             handle_disconnect(sock)
+            return True
 
         elif cmd == "/files":
             send_files_list(sock)
@@ -232,8 +238,9 @@ def process_message(sock, text):
             send_fixed(sock, "Unknown command")
 
     else:
-        # Default: broadcast to all others (exclude sender)
         broadcast(f"{username}: {text}", exclude_sock=sock)
+
+    return False
 
 
 # ===== Main =====
@@ -245,14 +252,12 @@ def main():
 
     port = int(sys.argv[1])
 
-    # TCP server
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind(("", port))
     server_sock.listen(5)
     server_sock.setblocking(False)
 
-    # UDP server for file transfer
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.bind(("", UDP_PORT))
     udp_sock.setblocking(False)
@@ -274,13 +279,11 @@ def main():
 
             for sock in ready_read:
                 if sock is server_sock:
-                    # New TCP connection
                     try:
                         client_sock, addr = server_sock.accept()
                         client_sock.setblocking(False)
                         print(f"New connection from {addr[0]}:{addr[1]}")
 
-                        # First message is username
                         data = client_sock.recv(RECV_BUF)
                         username = data.decode(ENCODING).strip()
 
@@ -290,15 +293,15 @@ def main():
 
                         welcome = f"Welcome {username}!"
                         send_fixed(client_sock, welcome)
-                        broadcast(f"[{username}] has joined",
+                        broadcast(f"{username} has joined",
                                   exclude_sock=client_sock)
 
                         read_socks.append(client_sock)
-                    except:
+                    except Exception as e:
+                        print(f"Error accepting connection: {e}")
                         continue
 
                 elif sock is udp_sock:
-                    # UDP file request: "REQ filename username"
                     try:
                         data, addr = udp_sock.recvfrom(RECV_BUF)
                         try:
@@ -323,22 +326,20 @@ def main():
                                 str(filesize).encode(ENCODING), addr
                             )
 
-                            # FIXED: Add delay to prevent UDP packet flooding
                             time.sleep(0.01)
 
                             with open(filepath, "rb") as f:
                                 while True:
-                                    chunk = f.read(1400)  # Smaller chunks for UDP
+                                    chunk = f.read(1400)
                                     if not chunk:
                                         break
                                     udp_sock.sendto(chunk, addr)
-                                    # FIXED: Pace UDP packets to prevent overflow
-                                    time.sleep(0.001)  # 1ms delay between packets
-                    except:
+                                    time.sleep(UDP_PACING_DELAY)
+                    except Exception as e:
+                        print(f"UDP error: {e}")
                         continue
 
                 else:
-                    # TCP client socket
                     try:
                         data = sock.recv(FIXED_MSG_SIZE)
                         if not data:
@@ -352,8 +353,11 @@ def main():
                         except:
                             continue
 
-                        process_message(sock, text)
-                    except:
+                        socket_closed = process_message(sock, text)
+                        if socket_closed and sock in read_socks:
+                            read_socks.remove(sock)
+
+                    except Exception:
                         handle_disconnect(sock)
                         if sock in read_socks:
                             read_socks.remove(sock)
